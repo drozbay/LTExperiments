@@ -1,0 +1,14 @@
+[project]
+name = "ltexperiments"
+description = "Context window sampling for LTXV / LTX-2 (LTXAV) video+audio models, including IC-LoRA guide splitting across windows. Self-contained; uses ComfyUI's context_handler and wrapper hooks (no core edits)."
+version = "0.1.0"
+license = {file = "LICENSE"}
+
+[project.urls]
+Repository = "https://github.com/drozbay/LTExperiments"
+#  Used by Comfy Registry https://registry.comfy.org
+
+[tool.comfy]
+PublisherId = "drozbay"
+DisplayName = "LTExperiments"
+Icon = ""
