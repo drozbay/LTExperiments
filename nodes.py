@@ -5,10 +5,33 @@ LTXV / LTX-2 sampling.
 """
 from comfy_api.latest import ComfyExtension, io
 import nodes
+import node_helpers
+import comfy.utils
+import comfy.model_management
 
 from . import context_windows as cw
+from . import perwindow_guides as pw
 
 CATEGORY = "LTExperiments"
+
+
+def _encode_guide(vae, latent_width, latent_height, images):
+    """Encode guide image(s) to latent space sized to match the sampling latent (mirrors LTXVAddGuide.encode)."""
+    scale_factors = vae.downscale_index_formula  # (time, height, width)
+    time_scale_factor = scale_factors[0]
+    images = images[:(images.shape[0] - 1) // time_scale_factor * time_scale_factor + 1]
+    target_w = int(latent_width * scale_factors[2])
+    target_h = int(latent_height * scale_factors[1])
+    pixels = comfy.utils.common_upscale(images.movedim(-1, 1), target_w, target_h, "bilinear", crop="center").movedim(1, -1)
+    return vae.encode(pixels[:, :, :, :3])
+
+
+def _existing_perwindow_guides(cond):
+    for t in cond:
+        v = t[1].get(pw.PERWINDOW_KEY)
+        if v:
+            return list(v)
+    return []
 
 
 class LTEx_ContextWindowsManualNode(io.ComfyNode):
@@ -106,10 +129,55 @@ class LTEx_LTXVContextWindowsNode(LTEx_ContextWindowsManualNode):
                                cond_retain_index_list=retain_index_list, latent_retain_index_list=retain_index_list, split_conds_to_windows=split_conds_to_windows)
 
 
+class LTEx_LTXVAddPerWindowGuideNode(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="LTEx_LTXVAddPerWindowGuide",
+            display_name="LTEx LTXV Add Per-Window Guide",
+            category=CATEGORY,
+            description="Inject a guide image at the same relative position in every context window. Requires the LTEx LTXV Context Windows node on the model.",
+            inputs=[
+                io.Conditioning.Input("positive"),
+                io.Conditioning.Input("negative"),
+                io.Vae.Input("vae", tooltip="VAE used to encode the guide image."),
+                io.Latent.Input("latent", tooltip="The latent being sampled. Used to size the guide encode; not modified."),
+                io.Image.Input("image", tooltip="Guide image. Multiple frames fill consecutive positions starting at index."),
+                io.Int.Input("rel_index", default=-1, min=-nodes.MAX_RESOLUTION, max=nodes.MAX_RESOLUTION,
+                             tooltip="Position of the guide within every window, counted in latent frames. 0 is the window's first frame; use negative values to place it before the first frame."),
+                io.Float.Input("strength", default=1.0, min=0.0, max=1.0, step=0.01,
+                               tooltip="How strongly the guide influences each window. Accepts a single value, or a list of per-window strengths (e.g. from a String to Float List node) indexed by window order, clamping to the last value; set a window's value to 0 to skip the guide for that window."),
+                io.Mask.Input("attention_mask", optional=True, tooltip="Optional mask limiting where the guide applies."),
+            ],
+            outputs=[
+                io.Conditioning.Output(display_name="positive"),
+                io.Conditioning.Output(display_name="negative"),
+            ],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, positive, negative, vae, latent, image, rel_index: int, strength, attention_mask=None) -> io.NodeOutput:
+        _, _, _, latent_height, latent_width = latent["samples"].shape
+        t = _encode_guide(vae, latent_width, latent_height, image).to(comfy.model_management.intermediate_device())
+        guide = {
+            "latent": t,
+            "rel_index": int(rel_index),
+            "strength": [float(x) for x in strength] if isinstance(strength, (list, tuple)) else float(strength),
+            "pixel_mask": attention_mask.unsqueeze(0).unsqueeze(0) if attention_mask is not None else None,
+        }
+        outs = []
+        for cond in (positive, negative):
+            guides = [*_existing_perwindow_guides(cond), guide]
+            outs.append(node_helpers.conditioning_set_values(cond, {pw.PERWINDOW_KEY: guides}))
+        return io.NodeOutput(outs[0], outs[1])
+
+
 class LTExperimentsExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
             LTEx_LTXVContextWindowsNode,
+            LTEx_LTXVAddPerWindowGuideNode,
         ]
 
 

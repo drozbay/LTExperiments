@@ -12,6 +12,7 @@ otherwise (see ``guides``).
 """
 from __future__ import annotations
 from typing import TYPE_CHECKING, Callable
+import bisect
 import torch
 import logging
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from comfy.context_windows import (
     create_weights_pyramid,
 )
 from . import guides
+from . import perwindow_guides as pw
 
 if TYPE_CHECKING:
     from comfy.model_base import BaseModel
@@ -143,6 +145,7 @@ class WindowingState:
     dim: int = 0                                 # primary modality temporal dim for context windowing
     is_multimodal: bool = False
     temporal_downscale_ratio: int = 1            # model's pixel-to-latent temporal compression ratio
+    perwindow_guides: list = None                # prepared per-window guides injected into every window (primary modality)
 
     def prepare_window(self, window: IndexListContextWindow, model) -> IndexListContextWindow:
         """Reformat window for multimodal contexts by deriving per-modality index lists.
@@ -191,6 +194,12 @@ class WindowingState:
                 s, ng = self._inject_guide_frames(s, modality_window, modality_idx=idx)
             else:
                 ng = 0
+            # per-window guides ride on the primary modality, appended after any in-latent guides
+            if idx == 0 and self.perwindow_guides:
+                active = pw.active_guides(self.perwindow_guides, getattr(window, "canonical_index", 0))
+                if active:
+                    s = torch.cat([s, pw.window_guide_latent(active, self.dim, s.device)], dim=self.dim)
+                    ng += pw.total_frame_count(active)
             sliced.append(s)
             guide_frame_counts.append(ng)
         return sliced, guide_frame_counts
@@ -339,6 +348,9 @@ class IndexListContextHandler(ContextHandlerABC):
         extracted_guide_entries = self._get_guide_entries(conds)
         extracted_keyframe_idxs = self._get_keyframe_idxs(conds)
 
+        pw_raw = pw.get_perwindow_guides(conds)
+        perwindow_prepared = pw.prepare(model, pw_raw) if pw_raw else None
+
         # Strip guide frames (only from first modality for now)
         if extracted_guide_entries is not None:
             guide_count = sum(e["latent_shape"][0] for e in extracted_guide_entries)
@@ -358,7 +370,8 @@ class IndexListContextHandler(ContextHandlerABC):
             latent_shapes=latent_shapes,
             dim=self.dim,
             is_multimodal=is_multimodal,
-            temporal_downscale_ratio=model.latent_format.temporal_downscale_ratio)
+            temporal_downscale_ratio=model.latent_format.temporal_downscale_ratio,
+            perwindow_guides=perwindow_prepared)
 
     def should_use_context(self, model: BaseModel, conds: list[list[dict]], x_in: torch.Tensor, timestep: torch.Tensor, model_options: dict[str]) -> bool:
         window_state = self._build_window_state(x_in, conds, model) # build window_state to check frame counts, will be built again in execute
@@ -378,6 +391,10 @@ class IndexListContextHandler(ContextHandlerABC):
             self.prepare_control_objects(control.previous_controlnet, device)
         return control
 
+    def _canonical_index(self, first_frame: int) -> int:
+        """Map a window's first frame to the standard_static window it starts in (its strength bucket)."""
+        return max(0, bisect.bisect_right(self._canonical_starts, first_frame) - 1)
+
     def get_resized_cond(self, cond_in: list[dict], x_in: torch.Tensor, window: IndexListContextWindow, device=None) -> list:
         if cond_in is None:
             return None
@@ -391,8 +408,13 @@ class IndexListContextHandler(ContextHandlerABC):
         # cond object is a list containing a dict - outer list is irrelevant, so just loop through it
         for actual_cond in cond_in:
             resized_actual_cond = actual_cond.copy()
+            # per-window guides ride as a top-level cond key; consume it here and inject into model_conds below
+            has_pw = pw.PERWINDOW_KEY in actual_cond and bool(getattr(self, "_perwindow_prepared", None))
+            resized_actual_cond.pop(pw.PERWINDOW_KEY, None)
             # now we are in the inner dict - "pooled_output" is a tensor, "control" is a ControlBase object, "model_conds" is dictionary
             for key in actual_cond:
+                if key == pw.PERWINDOW_KEY:
+                    continue
                 try:
                     cond_item = actual_cond[key]
                     if isinstance(cond_item, torch.Tensor):
@@ -461,6 +483,8 @@ class IndexListContextHandler(ContextHandlerABC):
                             elif cond_key == "num_video_frames": # for SVD
                                 new_cond_item[cond_key] = cond_value._copy_with(cond_value.cond)
                                 new_cond_item[cond_key].cond = window.context_length
+                        if has_pw:
+                            pw.apply_to_window_cond(new_cond_item, self._perwindow_prepared, self._model, window, x_in)
                         resized_actual_cond[key] = new_cond_item
                     else:
                         resized_actual_cond[key] = cond_item
@@ -489,6 +513,15 @@ class IndexListContextHandler(ContextHandlerABC):
         self.set_step(timestep, model_options)
 
         window_state = self._build_window_state(x_in, conds, model)
+        self._perwindow_prepared = window_state.perwindow_guides
+        # Canonical (standard_static) window starts, used to map any schedule's windows to a stable
+        # per-window strength index via their first frame (see perwindow_guides.resolve_strength).
+        if window_state.perwindow_guides:
+            static_windows = get_matching_context_schedule(ContextSchedules.STATIC_STANDARD).func(
+                window_state.latents[0].size(self.dim), self, model_options)
+            self._canonical_starts = sorted({int(w[0]) for w in static_windows})
+        else:
+            self._canonical_starts = [0]
         num_modalities = len(window_state.latents)
 
         context_windows = self.get_context_windows(model, window_state.latents[0], model_options)
@@ -566,6 +599,7 @@ class IndexListContextHandler(ContextHandlerABC):
 
             # prepare the window accounting for multimodal windows
             window = window_state.prepare_window(window, model)
+            window.canonical_index = self._canonical_index(window.index_list[0])
 
             # causal_window_fix: prepend a pre-window frame that will be stripped post-forward.
             # Set anchor before slice_for_window so the latent slice and downstream cond slices both pick it up.
