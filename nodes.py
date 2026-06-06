@@ -199,6 +199,9 @@ class LTEx_LTXVAddGuideConditioningNode(io.ComfyNode):
                              tooltip="Pixel-frame index to place the guide at. For 9+ frame guides, frame_idx must be divisible by 8 (rounded down). Negative values count from the end."),
                 io.Float.Input("strength", default=1.0, min=0.0, max=1.0, step=0.01,
                                tooltip="How strongly the guide pins its frames. 1.0 locks them (clean), lower loosens; 0 ignores the guide."),
+                io.Mask.Input("attention_mask", optional=True,
+                              tooltip="Optional pixel-space spatial mask. Controls per-region guide influence via "
+                                      "self-attention, multiplied by strength. Same semantics as LTXVAddGuide."),
             ],
             outputs=[
                 io.Conditioning.Output(display_name="positive"),
@@ -209,8 +212,8 @@ class LTEx_LTXVAddGuideConditioningNode(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, positive, negative, vae, latent, image, frame_idx: int, strength: float) -> io.NodeOutput:
-        from comfy_extras.nodes_lt import LTXVAddGuide  # reuse core's encode + frame-index snapping
+    def execute(cls, positive, negative, vae, latent, image, frame_idx: int, strength: float, attention_mask=None) -> io.NodeOutput:
+        from comfy_extras.nodes_lt import LTXVAddGuide, _append_guide_attention_entry  # reuse core's encode + frame-index snapping + attn entries
 
         gc.install()  # idempotent; gated monkeypatch is a no-op unless guide keys are present
 
@@ -247,6 +250,13 @@ class LTEx_LTXVAddGuideConditioningNode(io.ComfyNode):
 
         positive = gc.append_guide(positive, t, coords, float(strength))
         negative = gc.append_guide(negative, t, coords, float(strength))
+
+        # Per-guide attention control: reuse core's entry helper. No latent dilation here, so
+        # pre_filter_count is just the guide's token count and latent_shape is its [F, H, W].
+        pre_filter_count = t.shape[2] * t.shape[3] * t.shape[4]
+        positive, negative = _append_guide_attention_entry(
+            positive, negative, pre_filter_count, list(t.shape[2:]), strength=strength, attention_mask=attention_mask,
+        )
         return io.NodeOutput(positive, negative, latent)
 
 

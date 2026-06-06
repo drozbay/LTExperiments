@@ -101,6 +101,16 @@ def _inject(self, x, pixel_coords, timestep, batch_size, merged_args):
         s = guide_strength[i] if guide_strength is not None else 1.0
         timestep_parts.append(sigma.expand(batch_size, gx.shape[1]) * max(0.0, 1.0 - float(s)))
 
+    # Enable the model's per-guide self-attention mask (spatial pixel_mask + strength attenuation).
+    # This path never drops guide tokens (no denoise-mask grid filter), so surviving_count ==
+    # pre_filter_count for every entry; the rest is reused from core's _build_guide_self_attention_mask.
+    merged_args["num_guide_tokens"] = sum(g.shape[1] for g in guide_tokens)
+    entries = merged_args.get("guide_attention_entries", None)
+    if entries:
+        merged_args["resolved_guide_entries"] = [
+            {**e, "surviving_count": e["pre_filter_count"]} for e in entries
+        ]
+
     vx = torch.cat([vx] + guide_tokens, dim=1)
     v_coords = torch.cat([v_coords, guide_coords.to(v_coords.device)], dim=2)
     timestep = torch.cat(timestep_parts, dim=1)
