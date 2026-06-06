@@ -4,6 +4,7 @@ Patches the model with this pack's forked context-window handler (see context_wi
 LTXV / LTX-2 sampling.
 """
 from comfy_api.latest import ComfyExtension, io
+import torch
 import nodes
 import node_helpers
 import comfy.utils
@@ -11,6 +12,7 @@ import comfy.model_management
 
 from . import context_windows as cw
 from . import perwindow_guides as pw
+from . import guide_cond as gc
 
 CATEGORY = "LTExperiments"
 
@@ -173,11 +175,110 @@ class LTEx_LTXVAddPerWindowGuideNode(io.ComfyNode):
         return io.NodeOutput(outs[0], outs[1])
 
 
+class LTEx_LTXVAddGuideConditioningNode(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        from comfy_extras.nodes_lt import ICLoRAParameters  # lazy: dodge custom-node load-order issues
+        return io.Schema(
+            node_id="LTEx_LTXVAddGuideConditioning",
+            display_name="LTEx LTXVAddGuide (Cond Only)",
+            category=CATEGORY,
+            description="Proof of concept: carry an LTXV / LTX-2 guide on the conditioning instead of "
+                        "appending it to the working latent (the LTXVAddGuide approach). The guide is "
+                        "injected as extra tokens inside the model forward and stripped before output, "
+                        "so no LTXVCropGuides node is needed and the latent is never modified. Works for "
+                        "LTXV and LTXAV (video stream). Installs a gated monkeypatch of the LTX forward "
+                        "that is a no-op unless this node is used. Drop-in alternative to LTXVAddGuide "
+                        "for A/B testing the conditioning-carried path.",
+            inputs=[
+                io.Conditioning.Input("positive"),
+                io.Conditioning.Input("negative"),
+                io.Vae.Input("vae"),
+                io.Latent.Input("latent", tooltip="The latent being sampled. Used only to size the guide encode; not modified."),
+                io.Image.Input("image", tooltip="Guide image or video. Must be 8*n + 1 frames or it is cropped to the nearest."),
+                io.Int.Input("frame_idx", default=0, min=-nodes.MAX_RESOLUTION, max=nodes.MAX_RESOLUTION,
+                             tooltip="Pixel-frame index to place the guide at. For 9+ frame guides, frame_idx must be divisible by 8 (rounded down). Negative values count from the end."),
+                io.Float.Input("strength", default=1.0, min=0.0, max=1.0, step=0.01,
+                               tooltip="How strongly the guide pins its frames. 1.0 locks them (clean), lower loosens; 0 ignores the guide."),
+                io.Mask.Input("attention_mask", optional=True,
+                              tooltip="Optional pixel-space spatial mask. Controls per-region guide influence via "
+                                      "self-attention, multiplied by strength. Same semantics as LTXVAddGuide."),
+                ICLoRAParameters.Input("iclora_parameters", optional=True,
+                                       tooltip="Optional IC-LoRA parameters (e.g. reference_downscale_factor > 1) from a "
+                                               "Get IC-LoRA Parameters node. The low-res reference is spread across the "
+                                               "full-res grid via dilated RoPE coordinates; the latent is still untouched."),
+            ],
+            outputs=[
+                io.Conditioning.Output(display_name="positive"),
+                io.Conditioning.Output(display_name="negative"),
+                io.Latent.Output(display_name="latent_passthrough", tooltip="Input latent, returned unmodified"),
+            ],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, positive, negative, vae, latent, image, frame_idx: int, strength: float, attention_mask=None, iclora_parameters=None) -> io.NodeOutput:
+        from comfy_extras.nodes_lt import LTXVAddGuide, _append_guide_attention_entry  # reuse core's encode + frame-index snapping + attn entries
+
+        gc.install()  # idempotent; gated monkeypatch is a no-op unless guide keys are present
+
+        scale_factors = vae.downscale_index_formula
+        latent_image = latent["samples"]
+        _, _, latent_length, latent_height, latent_width = latent_image.shape
+
+        # IC-LoRA references encode at 1/N spatial resolution and are spread across the full-res grid.
+        latent_downscale_factor = LTXVAddGuide.get_reference_downscale_factor(iclora_parameters)
+        if latent_downscale_factor > 1 and (latent_width % latent_downscale_factor or latent_height % latent_downscale_factor):
+            raise ValueError(
+                f"Latent spatial size {latent_width}x{latent_height} must be divisible by "
+                f"reference_downscale_factor {latent_downscale_factor} from the IC-LoRA parameters."
+            )
+
+        # Mirror LTXVAddGuide's causal first-frame handling for mid-video multi-frame guides.
+        time_scale_factor = scale_factors[0]
+        num_frames_to_keep = ((image.shape[0] - 1) // time_scale_factor) * time_scale_factor + 1
+        resolved_frame_idx = frame_idx
+        if frame_idx < 0:
+            resolved_frame_idx = max((latent_length - 1) * time_scale_factor + 1 + frame_idx, 0)
+        causal_fix = resolved_frame_idx == 0 or num_frames_to_keep == 1
+
+        if not causal_fix:
+            image = torch.cat([image[:1], image], dim=0)
+
+        image, t = LTXVAddGuide.encode(vae, latent_width, latent_height, image, scale_factors, latent_downscale_factor)
+
+        if not causal_fix:
+            t = t[:, :, 1:, :, :]
+            image = image[1:]
+
+        # Snap/resolve frame_idx (num_keyframes is 0 here since nothing is added to the latent).
+        frame_idx, latent_idx = LTXVAddGuide.get_latent_index(
+            positive, latent_length, len(image), frame_idx, scale_factors, latent_shape=latent_image.shape
+        )
+        if latent_idx + t.shape[2] > latent_length:
+            raise ValueError("Guide frames exceed the length of the latent sequence.")
+
+        t = t.to(comfy.model_management.intermediate_device())
+        coords = gc.compute_guide_coords(t, frame_idx, scale_factors, causal_fix, latent_downscale_factor)
+
+        positive = gc.append_guide(positive, t, coords, float(strength))
+        negative = gc.append_guide(negative, t, coords, float(strength))
+
+        # Per-guide attention control: reuse core's entry helper. No latent dilation here, so
+        # pre_filter_count is just the guide's token count and latent_shape is its [F, H, W].
+        pre_filter_count = t.shape[2] * t.shape[3] * t.shape[4]
+        positive, negative = _append_guide_attention_entry(
+            positive, negative, pre_filter_count, list(t.shape[2:]), strength=strength, attention_mask=attention_mask,
+        )
+        return io.NodeOutput(positive, negative, latent)
+
+
 class LTExperimentsExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
             LTEx_LTXVContextWindowsNode,
             LTEx_LTXVAddPerWindowGuideNode,
+            LTEx_LTXVAddGuideConditioningNode,
         ]
 
 
