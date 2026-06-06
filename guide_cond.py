@@ -37,12 +37,34 @@ _PATCHED = False
 # --------------------------------------------------------------------------------------------
 # Node-side helpers (model-free): coordinates + conditioning accumulation
 # --------------------------------------------------------------------------------------------
-def compute_guide_coords(guide_latent, frame_idx, scale_factors, causal_fix):
+def compute_guide_coords(guide_latent, frame_idx, scale_factors, causal_fix, latent_downscale_factor=1):
     """Pixel-space keyframe coordinates for a guide latent placed at pixel-frame ``frame_idx``.
 
-    Mirrors LTXVAddGuide.add_keyframe_index (without IC-LoRA dilation): patchify for the base grid,
-    then offset the temporal channel by frame_idx. Shape: (B, [t,h,w], token, [start,end]).
+    Mirrors LTXVAddGuide.add_keyframe_index. For a plain guide (``latent_downscale_factor == 1``):
+    patchify for the base grid, then offset the temporal channel by frame_idx.
+
+    For IC-LoRA references (``latent_downscale_factor > 1``) the low-res guide tokens are spread
+    across the full-res grid (dilation) and each token's spatial RoPE *end* is widened to represent
+    the larger patch it covers, exactly as core does. The hole positions are then dropped so only the
+    real tokens remain, in the same order as a plain patchify of the low-res ``guide_latent`` (so they
+    align with the model-side injected tokens). The conditioning path injects no dense grid, so unlike
+    core there is nothing to filter later. Shape: (B, [t,h,w], token, [start,end]).
     """
+    if latent_downscale_factor > 1:
+        from comfy_extras.nodes_lt import LTXVAddGuide
+        dilated, dilated_mask = LTXVAddGuide.dilate_latent(guide_latent, latent_downscale_factor)
+        _, latent_coords = _PATCHIFIER.patchify(dilated)
+        pixel_coords = latent_to_pixel_coords(latent_coords, scale_factors, causal_fix=causal_fix)
+        pixel_coords[:, 0] += frame_idx
+        spatial_end_offset = (latent_downscale_factor - 1) * torch.tensor(
+            scale_factors[1:], device=pixel_coords.device,
+        ).view(1, -1, 1, 1)
+        pixel_coords[:, 1:, :, 1:] += spatial_end_offset.to(pixel_coords.dtype)
+        # Holes are marked < 0 in the dilated mask; keep only the real tokens.
+        mask_tokens, _ = _PATCHIFIER.patchify(dilated_mask)
+        keep = mask_tokens[0, :, 0] > 0
+        return pixel_coords[:, :, keep, :]
+
     _, latent_coords = _PATCHIFIER.patchify(guide_latent)
     pixel_coords = latent_to_pixel_coords(latent_coords, scale_factors, causal_fix=causal_fix)
     pixel_coords[:, 0] += frame_idx
