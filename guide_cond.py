@@ -88,11 +88,16 @@ def _inject(self, x, pixel_coords, timestep, batch_size, merged_args):
 
     main_len = vx.shape[1]
 
-    # Recover per-batch sigma from the (video) timestep. With no base denoise_mask it is uniform;
-    # amax picks the full-noise value if a base mask were ever present.
+    # Full-noise reference sigma for the guide timestep: amax over any base per-token timestep, so a
+    # strength-1 guide still resolves to a clean (~0) timestep even under partial denoise.
     sigma = timestep.reshape(batch_size, -1).amax(dim=1, keepdim=True)  # [B, 1]
 
-    timestep_parts = [sigma.expand(batch_size, main_len)]
+    # Preserve a per-token base timestep (denoise_mask / partial-denoise / inpainting) on the main
+    # tokens rather than flattening to uniform sigma. Falls back to uniform when the incoming timestep
+    # is a single per-batch value (the common empty-latent, denoise=1.0 case).
+    base_ts = timestep.reshape(batch_size, -1)
+    main_ts = base_ts if base_ts.shape[1] == main_len else sigma.expand(batch_size, main_len)
+    timestep_parts = [main_ts]
     guide_tokens = []
     for i, lat in enumerate(guide_latents):
         gx, _ = self.patchifier.patchify(lat.to(device=vx.device, dtype=vx.dtype))
