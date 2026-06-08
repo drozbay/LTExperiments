@@ -38,7 +38,7 @@ from comfy.context_windows import (
     create_weights_pyramid,
 )
 from . import guides
-from . import perwindow_guides as pw
+from . import perwindow_guides as perwindow_guides
 
 if TYPE_CHECKING:
     from comfy.model_base import BaseModel
@@ -196,10 +196,10 @@ class WindowingState:
                 ng = 0
             # per-window guides ride on the primary modality, appended after any in-latent guides
             if idx == 0 and self.perwindow_guides:
-                active = pw.active_guides(self.perwindow_guides, getattr(window, "canonical_index", 0))
+                active = perwindow_guides.active_guides(self.perwindow_guides, getattr(window, "canonical_index", 0))
                 if active:
-                    s = torch.cat([s, pw.window_guide_latent(active, self.dim, s.device)], dim=self.dim)
-                    ng += pw.total_frame_count(active)
+                    s = torch.cat([s, perwindow_guides.window_guide_latent(active, self.dim, s.device)], dim=self.dim)
+                    ng += perwindow_guides.total_frame_count(active)
             sliced.append(s)
             guide_frame_counts.append(ng)
         return sliced, guide_frame_counts
@@ -348,8 +348,8 @@ class IndexListContextHandler(ContextHandlerABC):
         extracted_guide_entries = self._get_guide_entries(conds)
         extracted_keyframe_idxs = self._get_keyframe_idxs(conds)
 
-        pw_raw = pw.get_perwindow_guides(conds)
-        perwindow_prepared = pw.prepare(model, pw_raw) if pw_raw else None
+        pw_raw = perwindow_guides.get_perwindow_guides(conds)
+        perwindow_prepared = perwindow_guides.prepare(model, pw_raw) if pw_raw else None
 
         # Strip guide frames (only from first modality for now)
         if extracted_guide_entries is not None:
@@ -409,11 +409,11 @@ class IndexListContextHandler(ContextHandlerABC):
         for actual_cond in cond_in:
             resized_actual_cond = actual_cond.copy()
             # per-window guides ride as a top-level cond key; consume it here and inject into model_conds below
-            has_pw = pw.PERWINDOW_KEY in actual_cond and bool(getattr(self, "_perwindow_prepared", None))
-            resized_actual_cond.pop(pw.PERWINDOW_KEY, None)
+            has_pw = perwindow_guides.PERWINDOW_KEY in actual_cond and bool(getattr(self, "_perwindow_prepared", None))
+            resized_actual_cond.pop(perwindow_guides.PERWINDOW_KEY, None)
             # now we are in the inner dict - "pooled_output" is a tensor, "control" is a ControlBase object, "model_conds" is dictionary
             for key in actual_cond:
-                if key == pw.PERWINDOW_KEY:
+                if key == perwindow_guides.PERWINDOW_KEY:
                     continue
                 try:
                     cond_item = actual_cond[key]
@@ -484,7 +484,7 @@ class IndexListContextHandler(ContextHandlerABC):
                                 new_cond_item[cond_key] = cond_value._copy_with(cond_value.cond)
                                 new_cond_item[cond_key].cond = window.context_length
                         if has_pw:
-                            pw.apply_to_window_cond(new_cond_item, self._perwindow_prepared, self._model, window, x_in)
+                            perwindow_guides.apply_to_window_cond(new_cond_item, self._perwindow_prepared, self._model, window, x_in)
                         resized_actual_cond[key] = new_cond_item
                     else:
                         resized_actual_cond[key] = cond_item

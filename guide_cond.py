@@ -29,10 +29,9 @@ GUIDE_COORDS_KEY = "guide_cond_keyframe_idxs"
 GUIDE_STRENGTH_KEY = "guide_cond_strength"
 
 # Standalone patchifier for node-side coord computation (matches LTXVModel.patchifier config).
-_PATCHIFIER = SymmetricPatchifier(1, start_end=True)
-
-_PATCHED = False
-
+LTXCONDGUIDE_ENABLED = False # Set to False by default. You must enable this manually for now.
+LTXCONDGUIDE_PATCHIFIER = SymmetricPatchifier(1, start_end=True)
+LTXCONDGUIDE_PATCHED = False
 
 # --------------------------------------------------------------------------------------------
 # Node-side helpers (model-free): coordinates + conditioning accumulation
@@ -53,7 +52,7 @@ def compute_guide_coords(guide_latent, frame_idx, scale_factors, causal_fix, lat
     if latent_downscale_factor > 1:
         from comfy_extras.nodes_lt import LTXVAddGuide
         dilated, dilated_mask = LTXVAddGuide.dilate_latent(guide_latent, latent_downscale_factor)
-        _, latent_coords = _PATCHIFIER.patchify(dilated)
+        _, latent_coords = LTXCONDGUIDE_PATCHIFIER.patchify(dilated)
         pixel_coords = latent_to_pixel_coords(latent_coords, scale_factors, causal_fix=causal_fix)
         pixel_coords[:, 0] += frame_idx
         spatial_end_offset = (latent_downscale_factor - 1) * torch.tensor(
@@ -61,11 +60,11 @@ def compute_guide_coords(guide_latent, frame_idx, scale_factors, causal_fix, lat
         ).view(1, -1, 1, 1)
         pixel_coords[:, 1:, :, 1:] += spatial_end_offset.to(pixel_coords.dtype)
         # Holes are marked < 0 in the dilated mask; keep only the real tokens.
-        mask_tokens, _ = _PATCHIFIER.patchify(dilated_mask)
+        mask_tokens, _ = LTXCONDGUIDE_PATCHIFIER.patchify(dilated_mask)
         keep = mask_tokens[0, :, 0] > 0
         return pixel_coords[:, :, keep, :]
 
-    _, latent_coords = _PATCHIFIER.patchify(guide_latent)
+    _, latent_coords = LTXCONDGUIDE_PATCHIFIER.patchify(guide_latent)
     pixel_coords = latent_to_pixel_coords(latent_coords, scale_factors, causal_fix=causal_fix)
     pixel_coords[:, 0] += frame_idx
     return pixel_coords
@@ -236,8 +235,8 @@ def _make_patched_extra_conds(orig_extra_conds):
 def install():
     """Install the gated patches once. Idempotent across module reloads (guarded by a marker
     attribute on the patched callables)."""
-    global _PATCHED
-    if _PATCHED:
+    global LTXCONDGUIDE_PATCHED
+    if LTXCONDGUIDE_PATCHED or not LTXCONDGUIDE_ENABLED:
         return
 
     if not getattr(ltx_model.LTXBaseModel._forward, "_ltex_guide_cond", False):
@@ -249,4 +248,4 @@ def install():
         if not getattr(model_cls.extra_conds, "_ltex_guide_cond", False):
             model_cls.extra_conds = _make_patched_extra_conds(model_cls.extra_conds)
 
-    _PATCHED = True
+    LTXCONDGUIDE_PATCHED = True

@@ -10,9 +10,9 @@ import node_helpers
 import comfy.utils
 import comfy.model_management
 
-from . import context_windows as cw
-from . import perwindow_guides as pw
-from . import guide_cond as gc
+from . import context_windows as context_windows
+from . import perwindow_guides as perwindow_guides
+from . import guide_cond as guide_cond
 
 CATEGORY = "LTExperiments"
 
@@ -30,7 +30,7 @@ def _encode_guide(vae, latent_width, latent_height, images):
 
 def _existing_perwindow_guides(cond):
     for t in cond:
-        v = t[1].get(pw.PERWINDOW_KEY)
+        v = t[1].get(perwindow_guides.PERWINDOW_KEY)
         if v:
             return list(v)
     return []
@@ -49,14 +49,14 @@ class LTEx_ContextWindowsManualNode(io.ComfyNode):
                 io.Int.Input("context_length", min=1, default=16, tooltip="The length of the context window."),
                 io.Int.Input("context_overlap", min=0, default=4, tooltip="The overlap of the context window."),
                 io.Combo.Input("context_schedule", options=[
-                    cw.ContextSchedules.STATIC_STANDARD,
-                    cw.ContextSchedules.UNIFORM_STANDARD,
-                    cw.ContextSchedules.UNIFORM_LOOPED,
-                    cw.ContextSchedules.BATCHED,
-                    ], default=cw.ContextSchedules.STATIC_STANDARD, tooltip="Step-dependent scheduling algorithm for context windows."),
+                    context_windows.ContextSchedules.STATIC_STANDARD,
+                    context_windows.ContextSchedules.UNIFORM_STANDARD,
+                    context_windows.ContextSchedules.UNIFORM_LOOPED,
+                    context_windows.ContextSchedules.BATCHED,
+                    ], default=context_windows.ContextSchedules.STATIC_STANDARD, tooltip="Step-dependent scheduling algorithm for context windows."),
                 io.Int.Input("context_stride", min=1, default=1, tooltip="The stride of the context window; only applicable to uniform schedules."),
                 io.Boolean.Input("closed_loop", default=False, tooltip="Whether to close the context window loop; only applicable to looped schedules."),
-                io.Combo.Input("fuse_method", options=cw.ContextFuseMethods.LIST_STATIC, default=cw.ContextFuseMethods.PYRAMID, tooltip="The method to use to fuse the context windows."),
+                io.Combo.Input("fuse_method", options=context_windows.ContextFuseMethods.LIST_STATIC, default=context_windows.ContextFuseMethods.PYRAMID, tooltip="The method to use to fuse the context windows."),
                 io.Int.Input("dim", min=0, max=5, default=0, tooltip="The dimension to apply the context windows to."),
                 io.Boolean.Input("freenoise", default=False, tooltip="Whether to apply FreeNoise noise shuffling, improves window blending."),
                 io.String.Input("cond_retain_index_list", default="", tooltip="List of latent indices to retain in the conditioning tensors for each window. For concat-style I2V models (e.g. Wan I2V, HunyuanVideo I2V, Cosmos I2V, SVD) the encoded start image lives in the c_concat conditioning channels; setting this to '0' will retain that start image content at sub-pos 0 of every window."),
@@ -74,9 +74,9 @@ class LTEx_ContextWindowsManualNode(io.ComfyNode):
     def execute(cls, model: io.Model.Type, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, closed_loop: bool, fuse_method: str, dim: int, freenoise: bool,
                 cond_retain_index_list: list[int]=[], split_conds_to_windows: bool=False, latent_retain_index_list: list[int]=[], causal_window_fix: bool=True) -> io.Model:
         model = model.clone()
-        model.model_options["context_handler"] = cw.IndexListContextHandler(
-            context_schedule=cw.get_matching_context_schedule(context_schedule),
-            fuse_method=cw.get_matching_fuse_method(fuse_method),
+        model.model_options["context_handler"] = context_windows.IndexListContextHandler(
+            context_schedule=context_windows.get_matching_context_schedule(context_schedule),
+            fuse_method=context_windows.get_matching_fuse_method(fuse_method),
             context_length=context_length,
             context_overlap=context_overlap,
             context_stride=context_stride,
@@ -89,9 +89,9 @@ class LTEx_ContextWindowsManualNode(io.ComfyNode):
             causal_window_fix=causal_window_fix,
         )
         # make memory usage calculation only take into account the context window latents
-        cw.create_prepare_sampling_wrapper(model)
+        context_windows.create_prepare_sampling_wrapper(model)
         if freenoise: # no other use for this wrapper at this time
-            cw.create_sampler_sample_wrapper(model)
+            context_windows.create_sampler_sample_wrapper(model)
         return io.NodeOutput(model)
 
 
@@ -107,14 +107,14 @@ class LTEx_LTXVContextWindowsNode(LTEx_ContextWindowsManualNode):
             io.Int.Input("context_length", min=1, max=nodes.MAX_RESOLUTION, step=8, default=145, tooltip="The length of the context window in real frames. Must be 8*n + 1."),
             io.Int.Input("context_overlap", min=0, step=8, default=40, tooltip="The overlap of the context window in real frames."),
             io.Combo.Input("context_schedule", options=[
-                cw.ContextSchedules.STATIC_STANDARD,
-                cw.ContextSchedules.UNIFORM_STANDARD,
-                cw.ContextSchedules.UNIFORM_LOOPED,
-                cw.ContextSchedules.BATCHED,
-                ], default=cw.ContextSchedules.UNIFORM_STANDARD, tooltip="Step-dependent scheduling algorithm for context windows."),
+                context_windows.ContextSchedules.STATIC_STANDARD,
+                context_windows.ContextSchedules.UNIFORM_STANDARD,
+                context_windows.ContextSchedules.UNIFORM_LOOPED,
+                context_windows.ContextSchedules.BATCHED,
+                ], default=context_windows.ContextSchedules.UNIFORM_STANDARD, tooltip="Step-dependent scheduling algorithm for context windows."),
             io.Int.Input("context_stride", min=1, default=1, tooltip="The stride of the context window; only applicable to uniform schedules.", advanced=True),
             io.Boolean.Input("closed_loop", default=False, tooltip="Whether to close the context window loop; only applicable to looped schedules.", advanced=True),
-            io.Combo.Input("fuse_method", options=cw.ContextFuseMethods.LIST_STATIC, default=cw.ContextFuseMethods.PYRAMID, tooltip="The method to use to fuse the context windows."),
+            io.Combo.Input("fuse_method", options=context_windows.ContextFuseMethods.LIST_STATIC, default=context_windows.ContextFuseMethods.PYRAMID, tooltip="The method to use to fuse the context windows."),
             io.Boolean.Input("freenoise", default=True, tooltip="Whether to apply FreeNoise noise shuffling, improves window blending.", advanced=True),
             io.Boolean.Input("retain_first_frame", default=False, tooltip="Retain the first latent frame in every context window (may help retain initial reference)."),
             io.Boolean.Input("split_conds_to_windows", default=False, tooltip="Whether to split multiple conditionings (created by ConditionCombine) to each window based on region index.", advanced=True),
@@ -171,7 +171,7 @@ class LTEx_LTXVAddPerWindowGuideNode(io.ComfyNode):
         outs = []
         for cond in (positive, negative):
             guides = [*_existing_perwindow_guides(cond), guide]
-            outs.append(node_helpers.conditioning_set_values(cond, {pw.PERWINDOW_KEY: guides}))
+            outs.append(node_helpers.conditioning_set_values(cond, {perwindow_guides.PERWINDOW_KEY: guides}))
         return io.NodeOutput(outs[0], outs[1])
 
 
@@ -218,9 +218,13 @@ class LTEx_LTXVAddGuideConditioningNode(io.ComfyNode):
 
     @classmethod
     def execute(cls, positive, negative, vae, latent, image, frame_idx: int, strength: float, attention_mask=None, iclora_parameters=None) -> io.NodeOutput:
+        from guide_cond import LTXCONDGUIDE_ENABLED
+        if not LTXCONDGUIDE_ENABLED:
+            raise RuntimeError("The guide on conditioning functionality is gated behind the LTXCONDGUIDE_ENABLED variable in guide_cond.py. Set it to True to enable this node.")
+        
         from comfy_extras.nodes_lt import LTXVAddGuide, _append_guide_attention_entry  # reuse core's encode + frame-index snapping + attn entries
 
-        gc.install()  # idempotent; gated monkeypatch is a no-op unless guide keys are present
+        guide_cond.install()  # idempotent; gated monkeypatch is a no-op unless guide keys are present
 
         scale_factors = vae.downscale_index_formula
         latent_image = latent["samples"]
@@ -259,10 +263,10 @@ class LTEx_LTXVAddGuideConditioningNode(io.ComfyNode):
             raise ValueError("Guide frames exceed the length of the latent sequence.")
 
         t = t.to(comfy.model_management.intermediate_device())
-        coords = gc.compute_guide_coords(t, frame_idx, scale_factors, causal_fix, latent_downscale_factor)
+        coords = guide_cond.compute_guide_coords(t, frame_idx, scale_factors, causal_fix, latent_downscale_factor)
 
-        positive = gc.append_guide(positive, t, coords, float(strength))
-        negative = gc.append_guide(negative, t, coords, float(strength))
+        positive = guide_cond.append_guide(positive, t, coords, float(strength))
+        negative = guide_cond.append_guide(negative, t, coords, float(strength))
 
         # Per-guide attention control: reuse core's entry helper. No latent dilation here, so
         # pre_filter_count is just the guide's token count and latent_shape is its [F, H, W].
